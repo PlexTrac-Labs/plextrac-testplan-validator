@@ -1,0 +1,7 @@
+== exit ==
+0
+== stdout ==
+OWASP_WSTG.yaml  (115 objects, 789 KB)
+  0 error(s), 0 warning(s)
+  OK to import
+== stderr ==

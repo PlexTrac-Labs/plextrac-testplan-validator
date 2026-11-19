@@ -1,0 +1,29 @@
+== exit ==
+1
+== stdout ==
+{
+  "file": "broken.yaml",
+  "errors": 2,
+  "warnings": 1,
+  "error_list": [
+    {
+      "check": "tags.nonempty",
+      "message": "tags must be an empty list at import time, found ['web'].",
+      "where": "procedures[1] MINI-P2"
+    },
+    {
+      "check": "reference.dangling",
+      "message": "methodologyIds 'c888888888888888888888888' is not defined in this file. The import inserts a link to a methodology row that does not exist and fails on a foreign key constraint.",
+      "where": "tactics[0] MINI-T1"
+    }
+  ],
+  "warning_list": [
+    {
+      "check": "reference.unused",
+      "message": "1 procedure(s) defined but not listed in testPlan.procedureIds. They import but will not appear in the test plan.",
+      "where": "testPlan"
+    }
+  ],
+  "fixes": []
+}
+== stderr ==

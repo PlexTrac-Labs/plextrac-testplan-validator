@@ -1,0 +1,10 @@
+== exit ==
+1
+== stdout ==
+broken.yaml  (10 objects, 3 KB)
+  ERROR  tags.nonempty  [procedures[1] MINI-P2]
+         tags must be an empty list at import time, found ['web'].
+  ERROR  reference.dangling  [tactics[0] MINI-T1]
+         methodologyIds 'c888888888888888888888888' is not defined in this file. The import inserts a link to a methodology row that does not exist and fails on a foreign key constraint.
+  2 error(s), 1 warning(s)
+== stderr ==

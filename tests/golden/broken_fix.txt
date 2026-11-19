@@ -1,0 +1,15 @@
+== exit ==
+1
+== stdout ==
+broken.yaml  (10 objects, 3 KB)
+  ERROR  tags.nonempty  [procedures[1] MINI-P2]
+         tags must be an empty list at import time, found ['web'].
+  ERROR  reference.dangling  [tactics[0] MINI-T1]
+         methodologyIds 'c888888888888888888888888' is not defined in this file. The import inserts a link to a methodology row that does not exist and fails on a foreign key constraint.
+  WARN   reference.unused  [testPlan]
+         1 procedure(s) defined but not listed in testPlan.procedureIds. They import but will not appear in the test plan.
+  fixed 2 item(s), written to fixed.yaml:
+         tactics 'MINI-T1': dropped methodologyIds ['c888888888888888888888888']
+         procedures 'MINI-P2': emptied tags
+  2 error(s), 1 warning(s)
+== stderr ==
