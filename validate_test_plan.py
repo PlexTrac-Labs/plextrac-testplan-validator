@@ -24,6 +24,7 @@ Requires PyYAML only.
 """
 import argparse
 import contextlib
+import difflib
 import functools
 import json
 import os
@@ -32,6 +33,7 @@ import select
 import sys
 import threading
 import unicodedata
+from pathlib import Path
 from typing import (Any, Callable, Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Set,
                     Tuple)
 
@@ -1033,6 +1035,186 @@ def prompt(label: Line, initial: str, out: Any, keys: Iterator[str], truecolor: 
     out.write("\r\x1b[2K" + render(head + [(text, f"fg:{ACCENT}")], truecolor) + "\n")
     out.flush()
     return text
+
+
+# --------------------------------------------------------------------------- screens
+
+EIGHTHS = " ▏▎▍▌▋▊▉"
+BAR_CELLS = 34
+HELP_OPTIONS = (
+    ("plan.yaml", "The test plan to check. Leave it out to pick one from this folder."),
+    ("--fix OUT", "Write a repaired copy to OUT. Your original is never changed."),
+    ("--quiet", "Errors only, hide warnings."),
+    ("--json", "Machine-readable output for scripts. Plain text, no graphics."),
+    ("--plain", "Plain text output, even in a terminal."),
+    ("-h, --help", "Show this screen."),
+)
+SYNTAX_TIP = [("Tip: ", "bold"), ("a value that contains ", ""), ('": "', "bold"), (" needs quotes, like ", ""),
+              ('shortName: "WSTG: draft"', f"fg:{ACCENT}")]
+
+
+def _width(caps: Caps) -> int:
+    return min(caps.width, CONTENT_WIDTH)
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def _bar(value: int, top: int) -> str:
+    cells = value / top * BAR_CELLS
+    full = int(cells)
+    rem = int((cells - full) * 8)
+    return ("█" * full + (EIGHTHS[rem] if rem and full < BAR_CELLS else "")) or "▏"
+
+
+def _tally(rep: Report, label: str) -> Tuple[int, int]:
+    return (sum(1 for i in rep.errors if group_of(i["check"]) == label),
+            sum(1 for i in rep.warnings if group_of(i["check"]) == label))
+
+
+def _neutral_border() -> str:
+    return gradient(STOPS, 0.35)
+
+
+def help_screen(caps: Caps) -> List[str]:
+    w, t = _width(caps), caps.truecolor
+    intro = ("Pre-flight checks for PlexTrac Runbooks V2 test plans: finds what would make an "
+             "import fail, before you upload it.")
+    out = [render([("  " + line, "dim")], t) for line in wrap_cells(intro, w - 2)]
+    usage = [("validate_test_plan.py", "bold"), (" ", ""), ("[plan.yaml]", f"fg:{ACCENT}"),
+             (" [--fix OUT] [--quiet] [--json] [--plain]", "dim")]
+    out += box([usage], [("usage", "bold")], w, _neutral_border(), t, pad_x=1, pad_y=0)
+    out += ["", render([("  options", "bold")], t)]
+    for flag, desc in HELP_OPTIONS:
+        lines = wrap_cells(desc, w - 15)
+        out.append(render([("  ", ""), (flag.ljust(11), f"bold fg:{ACCENT}"), ("  " + lines[0], "")], t))
+        out += [" " * 15 + more for more in lines[1:]]
+    out += ["", render([("  exit codes   ", "bold"), ("0", f"bold fg:{GREEN}"), (" ready to import   ", ""),
+                        ("1", f"bold fg:{RED}"), (" errors found   ", ""), ("2", f"bold fg:{YELLOW}"),
+                        (" couldn't read the file", "")], t)]
+    return out
+
+
+def results_panel(name: str, stats: PlanStats, rep: Report, kb: int, seconds: float, caps: Caps) -> List[str]:
+    top = max(list(stats.counts.values()) + [0]) or 1
+    label_width = max(len(s) for s in SECTIONS)
+    body: List[Line] = []
+    for i, section in enumerate(SECTIONS):
+        value = stats.counts.get(section, 0)
+        body.append([(section.rjust(label_width), "dim"), ("  ", ""),
+                     (_bar(value, top), f"fg:{gradient(STOPS, i / 4)}"), (" ", ""), (str(value), "bold")])
+    chips: Line = []
+    for label in LABELS:
+        errors, warnings = _tally(rep, label)
+        if chips:
+            chips.append(("   ", ""))
+        if errors:
+            chips += [("✘ ", f"bold fg:{RED}"), (label, f"fg:{RED}")]
+        else:
+            chips += [("✔ ", f"bold fg:{YELLOW if warnings else GREEN}"), (label, "")]
+    body += [[], chips, []]
+    if rep.errors:
+        body.append([(" NOT READY ", f"bold fg:#ffffff bg:{RED}"), ("  ", ""),
+                     (f"{_plural(len(rep.errors), 'error')} · {_plural(len(rep.warnings), 'warning')}", f"fg:{RED}")])
+    else:
+        body.append([(" READY TO IMPORT ", f"bold fg:#000000 bg:{GREEN}"), ("  ", ""),
+                     (f"{stats.objects} objects · {stats.links} links · {kb} KB · {seconds:.1f}s", "dim")])
+    return box(body, [(name, "bold")], _width(caps), _neutral_border(), caps.truecolor)
+
+
+def issues_table(rep: Report, auto: Set[IssueKey], quiet: bool, caps: Caps) -> List[str]:
+    w, t = _width(caps), caps.truecolor
+    where_w, fix_w = 22, 7
+    prob_w = max(10, w - 3 - where_w - 2 - 2 - fix_w)
+    header = "   " + "where".ljust(where_w) + "  " + "problem".ljust(prob_w) + "  " + "fix".rjust(fix_w)
+    out = [render([(header, "dim")], t), render([("─" * w, "dim")], t)]
+    items = [(i, True) for i in rep.errors] + ([] if quiet else [(i, False) for i in rep.warnings])
+    for item, is_error in items:
+        colour = RED if is_error else YELLOW
+        where_lines = wrap_cells(item["where"] or "", where_w)
+        problem_lines = [[(item["check"], f"fg:{colour}")]] + [[(m, "")] for m in wrap_cells(item["message"], prob_w)]
+        fix = pill("auto", GREEN) if issue_key(item) in auto else [("by hand", "dim")]
+        for r in range(max(len(where_lines), len(problem_lines))):
+            icon = ("✘" if is_error else "!", f"bold fg:{colour}") if r == 0 else (" ", "")
+            where = where_lines[r] if r < len(where_lines) else ""
+            problem = fit(problem_lines[r], prob_w) if r < len(problem_lines) else []
+            line = [icon, ("  ", ""), (where, "bold"), (" " * (where_w - cell_width(where)) + "  ", "")] + problem
+            if r == 0:
+                line += [(" " * (prob_w - line_width(problem) + 2 + fix_w - line_width(fix)), "")] + fix
+            out.append(render(line, t))
+    return out
+
+
+def syntax_error_screen(name: str, text: str, err: Any, caps: Caps) -> List[str]:
+    w, t = _width(caps), caps.truecolor
+    mark = getattr(err, "problem_mark", None)
+    problem = str(getattr(err, "problem", None) or err).strip()
+    title: Line = [("✘ ", f"bold fg:{RED}"), ("YAML syntax error", f"bold fg:{RED}"), (" · ", ""), (name, "bold")]
+    body: List[Line] = []
+    if mark is not None:
+        title.append((f" · line {mark.line + 1}, column {mark.column + 1}", "dim"))
+        lines = text.splitlines() + [""]
+        first, last = max(0, mark.line - 3), min(len(lines), mark.line + 4)
+        num_w = len(str(last)) + 2
+        for n in range(first, last):
+            here = n == mark.line
+            number = (f"❯ {n + 1}" if here else str(n + 1)).rjust(num_w)
+            body.append([(number, f"bold fg:{ACCENT}" if here else "dim"), (" │ ", "dim"),
+                         (lines[n].replace("\t", " "), "bold" if here else "dim")])
+            if here:
+                body.append([(" " * num_w, ""), (" │ ", "dim"),
+                             (" " * mark.column + "▲ " + problem, f"bold fg:{RED}")])
+    else:
+        body.append([(problem, f"fg:{RED}")])
+    out = box(body, title, w, RED, t)
+    if "mapping values are not allowed here" in problem:
+        tip = [("  ", "")] + SYNTAX_TIP
+        out += [render(tip, t)] if line_width(tip) <= w else \
+            ["  " + part for part in wrap_cells("".join(s for s, _ in SYNTAX_TIP), w - 2)]
+    out.append(render([("  ", ""), (" NOT READY ", f"bold fg:#ffffff bg:{RED}"), ("  ", ""),
+                       ("fix the line above and run it again", "dim")], t))
+    return out
+
+
+def _yaml_names(folder: Path) -> List[str]:
+    try:
+        return sorted(p.name for p in list(folder.glob("*.yaml")) + list(folder.glob("*.yml")))
+    except OSError:
+        return []
+
+
+def cannot_open_panel(path: str, error: Exception, caps: Caps) -> List[str]:
+    target = Path(path)
+    name = target.name or path
+    folder = target.resolve().parent
+    if isinstance(error, FileNotFoundError):
+        body: List[Line] = [[("No file called ", ""), (name, "bold"), (" in ", ""), (folder.name + "/", "bold")]]
+        near = difflib.get_close_matches(name, _yaml_names(folder), n=1)
+        if near:
+            body += [[], [("Did you mean ", ""), (near[0], f"bold fg:{ACCENT}"), ("?", "")]]
+        body += [[], [("Tip: run it without a file name to pick one from this folder.", "dim")]]
+    elif isinstance(error, UnicodeDecodeError):
+        body = [[(name, "bold"), (" isn't UTF-8 text. Save it as UTF-8 and run it again.", "")]]
+    else:
+        body = [[(name, "bold"), (": " + (getattr(error, "strerror", None) or str(error)), "")]]
+    title = [("✘ ", f"bold fg:{RED}"), ("Can't open the file", f"bold fg:{RED}")]
+    return box(body, title, _width(caps), RED, caps.truecolor)
+
+
+def nothing_to_pick_panel(folder: Path, caps: Caps) -> List[str]:
+    body: List[Line] = [
+        [("There are no ", ""), (".yaml", "bold"), (" files in ", ""), (folder.name + "/", "bold"), (".", "")],
+        [],
+        [("Point it at one:  ", "dim"), ("python3 validate_test_plan.py ", ""), ("path/to/plan.yaml", f"fg:{ACCENT}")],
+    ]
+    title = [("? ", f"bold fg:{ACCENT}"), ("Nothing to check here", "bold")]
+    return box(body, title, _width(caps), _neutral_border(), caps.truecolor)
+
+
+def cancelled_line(caps: Caps, wrote: bool = False) -> str:
+    tail = " Cancelled." if wrote else " Cancelled. Nothing was written."
+    return render([("  ", ""), ("✘", f"bold fg:{RED}"), (tail, "")], caps.truecolor)
 
 
 def run_plain(args: argparse.Namespace, text: str) -> int:
