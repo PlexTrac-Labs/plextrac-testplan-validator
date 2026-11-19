@@ -1217,6 +1217,115 @@ def cancelled_line(caps: Caps, wrote: bool = False) -> str:
     return render([("  ", ""), ("✘", f"bold fg:{RED}"), (tail, "")], caps.truecolor)
 
 
+# --------------------------------------------------------------------------- repair flow
+
+def _emit(out: Any, lines: List[str]) -> None:
+    out.write("\n".join(lines) + "\n")
+    out.flush()
+
+
+def _say(out: Any, message: str, caps: Caps) -> None:
+    _emit(out, [render([("  ✘ ", f"bold fg:{RED}"), (message, "")], caps.truecolor)])
+
+
+def receipt_panel(out_name: str, changes: List[Change], file_lines: List[str], left: int, caps: Caps) -> List[str]:
+    """What the repair changed, object by object, then file-level fixes."""
+    body: List[Line] = []
+    last = None
+    for change in changes:
+        if (change.section, change.name) != last:
+            if last is not None:
+                body.append([])
+            body.append([(change.section, "dim"), (" › ", "dim"), (change.name, "bold")])
+            last = (change.section, change.name)
+        values: Line = []
+        for value in change.removed:
+            if values:
+                values.append(("  ", ""))
+            values += [("− ", f"fg:{RED}"), (str(value), f"strike fg:{RED}")]
+        if change.field == "tags":
+            values += [("  ", ""), ("→ []", f"bold fg:{GREEN}")]
+        body.append([("  ", ""), (change.field, f"fg:{ACCENT}"), (" " * max(2, 17 - len(change.field)), "")] + values)
+    if file_lines:
+        if body:
+            body.append([])
+        body.append([("file", "dim")])
+        body += [[("  " + line, "")] for line in file_lines]
+    repairs = len(changes) + len(file_lines)
+    body += [[], [("✔ ", f"bold fg:{GREEN}"), (_plural(repairs, "repair"), "bold"), ("     ", ""),
+                  ("✎ ", f"fg:{YELLOW}"), (f"{left} left for you", ""), ("     ", ""),
+                  ("original file untouched", "dim")]]
+    title = [("🔧 ", ""), ("Repaired copy", "bold"), (" · ", ""), (out_name, f"bold fg:{ACCENT}")]
+    return box(body, title, _width(caps), gradient(STOPS, 0.65), caps.truecolor)
+
+
+def recheck_panel(name: str, res: CheckResult, stats: PlanStats, caps: Caps) -> List[str]:
+    """One-line verdict for the repaired copy."""
+    rep = res.report
+    if rep.errors:
+        border = RED
+        line = [(" STILL NOT READY ", f"bold fg:#ffffff bg:{RED}"), ("  ", ""),
+                (f"{_plural(len(rep.errors), 'error')} left to fix by hand", f"fg:{RED}")]
+    else:
+        border = GREEN
+        extra = f" · {_plural(len(rep.warnings), 'warning')} left" if rep.warnings else ""
+        line = [(" READY TO IMPORT ", f"bold fg:#000000 bg:{GREEN}"), ("  ", ""),
+                (f"{stats.objects} objects · {stats.links} links{extra}", "dim")]
+    return box([line], [("re-checked · ", ""), (name, "bold")], _width(caps), border, caps.truecolor, pad_y=0)
+
+
+def write_repair(doc: dict, text: str, rep: Report, target: Path, out: Any, caps: Caps) -> CheckResult:
+    """Write the repaired copy, re-check it, and show what changed."""
+    with Spinner([("Repairing → ", ""), (target.name, "bold"), ("…", "")], out, caps.truecolor):
+        new_text, fixed = repaired_text(doc, text)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(new_text)
+    with Spinner([("Re-checking ", ""), (target.name, "bold"), ("…", "")], out, caps.truecolor):
+        again = run_checks(new_text)
+    left = len(again.report.errors) + len(again.report.warnings)
+    _emit(out, receipt_panel(target.name, repair_changes(doc, fixed), file_fixes(rep), left, caps))
+    _emit(out, recheck_panel(target.name, again, plan_stats(again.doc), caps))
+    return again
+
+
+def offer_repair(path: Path, text: str, res: CheckResult, auto: Set[IssueKey], out: Any,
+                 keys: Iterator[str], caps: Caps) -> Optional[Path]:
+    """Offer to save a repaired copy next to the original. Never writes the original."""
+    if not can_repair(res.doc) or not auto:
+        return None
+    t = caps.truecolor
+    total = len(res.report.errors) + len(res.report.warnings)
+    _emit(out, ["", render([("  🔧 ", ""), (f"{len(auto)} of {total}", f"bold fg:{ACCENT}"),
+                            (" problems can be repaired automatically", ""),
+                            ("  ·  original file untouched", "dim")], t), ""])
+    if not confirm([("Repair them and save a copy?", "bold")], True, out, keys, t):
+        _emit(out, [cancelled_line(caps)])
+        return None
+    default = f"{path.stem}.fixed.yaml"
+    while True:
+        name = prompt([("Save as", "bold")], default, out, keys, t)
+        if name is None:
+            _emit(out, [cancelled_line(caps)])
+            return None
+        name = name.strip()
+        if not name:
+            _say(out, "Type a file name.", caps)
+            continue
+        target = Path(name).expanduser()
+        if not target.is_absolute():
+            target = path.parent / target
+        if target.exists() and os.path.samefile(target, path):
+            _say(out, "That's your original file. Pick another name.", caps)
+            continue
+        if target.is_dir():
+            _say(out, "That's a folder. Pick a file name.", caps)
+            continue
+        if target.exists() and not confirm([(f"{target.name} exists. Overwrite?", "bold")], False, out, keys, t):
+            continue
+        write_repair(res.doc, text, res.report, target, out, caps)
+        return target
+
+
 def run_plain(args: argparse.Namespace, text: str) -> int:
     """The original plain-text and JSON output, unchanged. Returns the exit code."""
     res = run_checks(text)
