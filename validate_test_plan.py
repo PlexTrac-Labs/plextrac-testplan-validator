@@ -27,6 +27,7 @@ import functools
 import json
 import re
 import sys
+import threading
 import unicodedata
 from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
 
@@ -674,6 +675,152 @@ _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 def strip_ansi(s: str) -> str:
     return _ANSI.sub("", s)
+
+
+# --------------------------------------------------------------------------- drawing
+
+Seg = Tuple[str, str]  # (text, style spec for style_sgr)
+Line = List[Seg]
+RESET = "\x1b[0m"
+
+
+def render(line: Line, truecolor: bool) -> str:
+    parts = []
+    for text, spec in line:
+        sgr = style_sgr(spec, truecolor) if spec else ""
+        parts.append(f"{sgr}{text}{RESET}" if sgr else text)
+    return "".join(parts)
+
+
+def line_width(line: Line) -> int:
+    return sum(cell_width(text) for text, _ in line)
+
+
+def fit(line: Line, width: int) -> Line:
+    """Cut a line to `width` columns, ending in … when anything was cut."""
+    if width <= 0:
+        return []
+    if line_width(line) <= width:
+        return list(line)
+    limit, used, out, cut_spec = width - 1, 0, [], ""
+    for text, spec in line:
+        kept = []
+        for ch in text:
+            w = cell_width(ch)
+            if used + w > limit:
+                cut_spec = spec
+                break
+            kept.append(ch)
+            used += w
+        if kept:
+            out.append(("".join(kept), spec))
+        if len(kept) < len(text):
+            break
+    out.append((" " * (limit - used) + "…", cut_spec))
+    return out
+
+
+def gradient_line(text: str, bold: bool = True) -> Line:
+    n = max(len(text) - 1, 1)
+    weight = "bold " if bold else ""
+    return [(ch, f"{weight}fg:{gradient(STOPS, i / n)}") for i, ch in enumerate(text)]
+
+
+def box(body: List[Line], title: Line, width: int, border: str, truecolor: bool,
+        pad_x: int = 2, pad_y: int = 1) -> List[str]:
+    """A rounded box exactly `width` columns wide, title set into the top border."""
+    edge = f"fg:{border}"
+    inner = width - 2 - 2 * pad_x
+    if title:
+        shown = fit(title, max(0, width - 6))
+        top = [("╭─ ", edge)] + shown + [(" " + "─" * (width - 5 - line_width(shown)) + "╮", edge)]
+    else:
+        top = [("╭" + "─" * (width - 2) + "╮", edge)]
+    blank = render([("│", edge), (" " * (width - 2), ""), ("│", edge)], truecolor)
+    rows = [render(top, truecolor)] + [blank] * pad_y
+    for line in body:
+        content = fit(line, inner)
+        gap = inner - line_width(content)
+        rows.append(render([("│", edge), (" " * pad_x, "")] + content + [(" " * (gap + pad_x), ""), ("│", edge)],
+                           truecolor))
+    rows += [blank] * pad_y
+    rows.append(render([("╰" + "─" * (width - 2) + "╯", edge)], truecolor))
+    return rows
+
+
+def pill(label: str, color: str) -> Line:
+    """A solid badge with half-block ends (never padded with spaces)."""
+    return [("▐", f"fg:{color}"), (label, f"bold fg:#000000 bg:{color}"), ("▌", f"fg:{color}")]
+
+
+FONT = {  # figlet "ANSI Shadow"
+    "T": ("████████╗", "╚══██╔══╝", "   ██║   ", "   ██║   ", "   ██║   ", "   ╚═╝   "),
+    "E": ("███████╗", "██╔════╝", "█████╗  ", "██╔══╝  ", "███████╗", "╚══════╝"),
+    "S": ("███████╗", "██╔════╝", "███████╗", "╚════██║", "███████║", "╚══════╝"),
+    "P": ("██████╗ ", "██╔══██╗", "██████╔╝", "██╔═══╝ ", "██║     ", "╚═╝     "),
+    "L": ("██╗     ", "██║     ", "██║     ", "██║     ", "███████╗", "╚══════╝"),
+    "A": (" █████╗ ", "██╔══██╗", "███████║", "██╔══██║", "██║  ██║", "╚═╝  ╚═╝"),
+    "N": ("███╗   ██╗", "████╗  ██║", "██╔██╗ ██║", "██║╚██╗██║", "██║ ╚████║", "╚═╝  ╚═══╝"),
+    " ": ("  ",) * 6,
+}
+
+
+def banner(columns: int, truecolor: bool) -> List[str]:
+    """The big gradient TEST PLAN wordmark, or a one-line title in narrow terminals."""
+    if columns < BIG_BANNER_COLUMNS:
+        line = [("  ", "")] + gradient_line("TEST PLAN") + [(" validator · PlexTrac Runbooks V2", "dim")]
+        return [render(line, truecolor)]
+    rows = ["".join(FONT[ch][r] for ch in "TEST PLAN") for r in range(6)]
+    last = len(rows[0]) - 1
+    out = [""]
+    for row in rows:
+        line = [("  ", "")]
+        for x, ch in enumerate(row):
+            if ch == " ":
+                line.append((" ", ""))
+                continue
+            colour = gradient(STOPS, x / last)
+            line.append((ch, f"bold fg:{colour}" if ch == "█" else f"fg:{shade(colour, 0.45)}"))
+        out.append(render(line, truecolor))
+    subtitle = gradient_line("v a l i d a t o r", bold=False) + [("   ·   PlexTrac Runbooks V2", "dim")]
+    out.append(render([(" " * (72 - line_width(subtitle)), "")] + subtitle, truecolor))
+    out.append("")
+    return out
+
+
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+class Spinner:
+    """A one-line spinner while the body runs, erased afterwards."""
+
+    def __init__(self, text: Line, out: Any, truecolor: bool, interval: float = 0.08):
+        self.text, self.out, self.truecolor, self.interval = text, out, truecolor, interval
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _run(self) -> None:
+        i = 0
+        while not self._stop.is_set():
+            frame = [(SPINNER_FRAMES[i % len(SPINNER_FRAMES)], f"bold fg:{ACCENT}"), (" ", "")]
+            self.out.write("\r" + render(frame + self.text, self.truecolor))
+            self.out.flush()
+            i += 1
+            self._stop.wait(self.interval)
+
+    def __enter__(self) -> "Spinner":
+        self.out.write("\x1b[?25l")
+        self.out.flush()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+        self.out.write("\r\x1b[2K\x1b[?25h")
+        self.out.flush()
 
 
 def run_plain(args: argparse.Namespace, text: str) -> int:
