@@ -26,6 +26,7 @@ import argparse
 import json
 import re
 import sys
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 try:
     import yaml
@@ -310,27 +311,43 @@ def dump(doc):
     return out + "runbook: *ref_0\n"
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Validate a PlexTrac Runbooks V2 "
-                                             "test plan YAML before importing it.")
-    ap.add_argument("path")
-    ap.add_argument("--json", action="store_true", help="machine-readable output")
-    ap.add_argument("--fix", metavar="OUT", help="write a repaired copy to OUT")
-    ap.add_argument("--quiet", action="store_true", help="errors only")
-    args = ap.parse_args()
+IssueKey = Tuple[str, str, Optional[str]]
+SECTIONS = ("methodologies", "tactics", "techniques", "repositories", "procedures")
+LABELS = ("YAML syntax", "Structure", "IDs", "References", "Content")
+_GROUP_PREFIXES = (("yaml.", "YAML syntax"), ("schema.", "Structure"), ("id.", "IDs"),
+                   ("reference.", "References"), ("runbook.", "References"),
+                   ("tags.", "Content"), ("content.", "Content"))
 
+
+def issue_key(item: dict) -> IssueKey:
+    """Identity of one reported issue, for comparing two reports."""
+    return (item["check"], item["message"], item["where"])
+
+
+def group_of(check: str) -> str:
+    """Which of the five check groups a check id belongs to."""
+    for prefix, label in _GROUP_PREFIXES:
+        if check.startswith(prefix):
+            return label
+    return "Content"
+
+
+class CheckResult(NamedTuple):
+    report: Report
+    doc: Any
+    parse_error: Optional[yaml.YAMLError]
+
+
+def run_checks(text: str) -> CheckResult:
+    """Every check, in the order main() has always run them."""
     rep = Report()
-    try:
-        text = open(args.path, encoding="utf-8").read()
-    except OSError as e:
-        sys.exit(f"cannot read {args.path}: {e}")
-
     check_raw_text(text, rep)
 
-    doc = None
+    doc, parse_error = None, None
     try:
         doc = yaml.safe_load(text)
     except yaml.YAMLError as e:
+        parse_error = e
         mark = getattr(e, "problem_mark", None)
         where = f"line {mark.line + 1}, column {mark.column + 1}" if mark else None
         rep.error("yaml.parse", str(getattr(e, "problem", e)).strip(), where)
@@ -339,11 +356,57 @@ def main():
         check_objects(doc, rep)
         check_references(doc, rep)
         check_content(doc, rep)
+    return CheckResult(rep, doc, parse_error)
+
+
+class PlanStats(NamedTuple):
+    counts: Dict[str, int]
+    objects: int
+    links: int
+
+
+def _objects(doc: dict, section: str) -> List[dict]:
+    items = doc.get(section)
+    return [o for o in items if isinstance(o, dict)] if isinstance(items, list) else []
+
+
+def _count(value: Any) -> int:
+    if isinstance(value, list):
+        return len(value)
+    return 1 if value else 0
+
+
+def plan_stats(doc: Any) -> PlanStats:
+    """Objects per section and cross-reference links, for the results panel."""
+    if not isinstance(doc, dict):
+        return PlanStats({k: 0 for k in SECTIONS}, 0, 0)
+    counts = {k: len(doc[k]) if isinstance(doc.get(k), list) else 0 for k in SECTIONS}
+    links = sum(_count(o.get(field))
+                for section, field in (("tactics", "methodologyIds"), ("techniques", "tacticIds"),
+                                       ("procedures", "techniqueIds"))
+                for o in _objects(doc, section))
+    links += sum(1 for o in _objects(doc, "procedures") if o.get("repositoryId"))
+    tp = doc.get("testPlan")
+    if isinstance(tp, dict):
+        links += _count(tp.get("procedureIds"))
+    return PlanStats(counts, sum(counts.values()), links)
+
+
+def read_plan(path: str) -> str:
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def run_plain(args: argparse.Namespace, text: str) -> int:
+    """The original plain-text and JSON output, unchanged. Returns the exit code."""
+    res = run_checks(text)
+    rep, doc = res.report, res.doc
 
     fixes = []
     if args.fix and doc is not None:
         fixes = autofix(doc, text, rep)
-        open(args.fix, "w", encoding="utf-8").write(dump(doc))
+        with open(args.fix, "w", encoding="utf-8") as f:
+            f.write(dump(doc))
 
     counts = {"errors": len(rep.errors), "warnings": len(rep.warnings)}
     if args.json:
@@ -369,8 +432,25 @@ def main():
         if not counts["errors"]:
             print("  OK to import")
 
-    sys.exit(1 if rep.errors else 0)
+    return 1 if rep.errors else 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description="Validate a PlexTrac Runbooks V2 "
+                                             "test plan YAML before importing it.")
+    ap.add_argument("path")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--fix", metavar="OUT", help="write a repaired copy to OUT")
+    ap.add_argument("--quiet", action="store_true", help="errors only")
+    args = ap.parse_args(argv)
+
+    try:
+        text = read_plan(args.path)
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"cannot read {args.path}: {e}", file=sys.stderr)
+        return 2
+    return run_plain(args, text)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,5 +1,5 @@
 == exit ==
-1
+2
 == stdout ==
 == stderr ==
 cannot read nope.yaml: [Errno 2] No such file or directory: 'nope.yaml'
