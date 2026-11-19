@@ -23,10 +23,12 @@ Exit codes: 0 clean (warnings allowed), 1 errors found, 2 could not read file.
 Requires PyYAML only.
 """
 import argparse
+import functools
 import json
 import re
 import sys
-from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
+import unicodedata
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
 
 try:
     import yaml
@@ -491,6 +493,187 @@ def file_fixes(rep: Report) -> List[str]:
     elif "runbook.alias" in checks:
         lines.append("runbook made an alias of testPlan")
     return lines
+
+
+# --------------------------------------------------------------------------- terminal
+
+STOPS = ("#22d3ee", "#818cf8", "#e879f9", "#fb7185")
+ACCENT = "#ff5faf"
+GREEN = "#4ade80"
+RED = "#dc2626"
+YELLOW = "#facc15"
+CONTENT_WIDTH = 78
+MIN_FANCY_COLUMNS = 60
+BIG_BANNER_COLUMNS = 74
+GLYPH_PROBE = "╭█▀▐❯✔✘─│"
+
+
+class Caps(NamedTuple):
+    fancy: bool
+    interactive: bool
+    truecolor: bool
+    width: int
+    height: int
+
+
+def _isatty(stream: Any) -> bool:
+    try:
+        return bool(stream is not None and stream.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _can_encode(stream: Any, text: str) -> bool:
+    try:
+        text.encode(getattr(stream, "encoding", None) or "ascii")
+        return True
+    except (UnicodeEncodeError, LookupError):
+        return False
+
+
+def detect_mode(plain: bool, json_out: bool, env: Mapping[str, str], stdout: Any, stdin: Any,
+                platform: str, size: Tuple[int, int], enable_vt: Callable[[], bool]) -> Caps:
+    """Graphics only where they render well and nothing else reads the output."""
+    width, height = size
+    truecolor = env.get("COLORTERM", "").lower() in ("truecolor", "24bit") or "WT_SESSION" in env
+    fancy = (_isatty(stdout) and not plain and not json_out and not env.get("NO_COLOR")
+             and env.get("TERM") != "dumb" and _can_encode(stdout, GLYPH_PROBE)
+             and width >= MIN_FANCY_COLUMNS)
+    if fancy and platform == "win32":
+        fancy = ("WT_SESSION" in env or env.get("TERM_PROGRAM") == "vscode") and enable_vt()
+    return Caps(bool(fancy), bool(fancy and _isatty(stdin)), truecolor, width, height)
+
+
+def enable_windows_vt() -> bool:
+    """Turn on colour-code processing in a Windows console. False if it can't."""
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # standard output
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:
+        return False
+
+
+def _rgb(color: str) -> Tuple[int, int, int]:
+    c = color.lstrip("#")
+    return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+
+
+def _hex(channels: Any) -> str:
+    return "#" + "".join(f"{max(0, min(255, int(round(v)))):02x}" for v in channels)
+
+
+def gradient(stops: Sequence[str], t: float) -> str:
+    t = max(0.0, min(1.0, float(t)))
+    if len(stops) == 1:
+        return stops[0].lower()
+    pos = t * (len(stops) - 1)
+    i = min(int(pos), len(stops) - 2)
+    a, b = _rgb(stops[i]), _rgb(stops[i + 1])
+    return _hex(x + (y - x) * (pos - i) for x, y in zip(a, b))
+
+
+def shade(color: str, k: float) -> str:
+    return _hex(v * k for v in _rgb(color))
+
+
+_CUBE = (0, 95, 135, 175, 215, 255)
+
+
+@functools.lru_cache(maxsize=None)
+def xterm256(color: str) -> int:
+    """Nearest xterm-256 colour: the 6x6x6 cube or the 24 greys."""
+    r, g, b = _rgb(color)
+
+    def dist(c: Tuple[int, int, int]) -> int:
+        return (c[0] - r) ** 2 + (c[1] - g) ** 2 + (c[2] - b) ** 2
+
+    idx = [min(range(6), key=lambda i: abs(_CUBE[i] - v)) for v in (r, g, b)]
+    best, best_dist = 16 + 36 * idx[0] + 6 * idx[1] + idx[2], dist(tuple(_CUBE[i] for i in idx))
+    for i in range(24):
+        level = 8 + 10 * i
+        d = dist((level, level, level))
+        if d < best_dist:
+            best, best_dist = 232 + i, d
+    return best
+
+
+_SGR = {"bold": "1", "dim": "2", "italic": "3", "underline": "4", "strike": "9"}
+
+
+def style_sgr(spec: str, truecolor: bool) -> str:
+    """'bold fg:#rrggbb bg:#rrggbb' -> one escape sequence."""
+    codes = []
+    for token in spec.split():
+        if token in _SGR:
+            codes.append(_SGR[token])
+        elif token.startswith(("fg:", "bg:")):
+            base = "38" if token.startswith("fg:") else "48"
+            if truecolor:
+                r, g, b = _rgb(token[3:])
+                codes.append(f"{base};2;{r};{g};{b}")
+            else:
+                codes.append(f"{base};5;{xterm256(token[3:])}")
+    return f"\x1b[{';'.join(codes)}m" if codes else ""
+
+
+_ZERO_WIDTH = {"​", "‌", "‍", "︎", "️"}
+
+
+def cell_width(s: str) -> int:
+    """Terminal columns a string takes."""
+    total = 0
+    for ch in s:
+        if ch in _ZERO_WIDTH or unicodedata.combining(ch):
+            continue
+        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return total
+
+
+def _cut(word: str, width: int) -> Tuple[str, str]:
+    """Split `word` after at most `width` columns (at least one character)."""
+    used, i = 0, 0
+    while i < len(word) and (i == 0 or used + cell_width(word[i]) <= width):
+        used += cell_width(word[i])
+        i += 1
+    return word[:i], word[i:]
+
+
+def wrap_cells(text: str, width: int) -> List[str]:
+    """Greedy word wrap by terminal columns; words wider than `width` are split."""
+    width = max(1, width)
+    lines: List[str] = []
+    current = ""
+    for word in text.split():
+        while cell_width(word) > width:
+            if current:
+                lines.append(current)
+                current = ""
+            head, word = _cut(word, width)
+            lines.append(head)
+        if not word:
+            continue
+        if not current:
+            current = word
+        elif cell_width(current) + 1 + cell_width(word) <= width:
+            current += " " + word
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def strip_ansi(s: str) -> str:
+    return _ANSI.sub("", s)
 
 
 def run_plain(args: argparse.Namespace, text: str) -> int:
