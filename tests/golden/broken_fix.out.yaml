@@ -1,0 +1,147 @@
+methodologies:
+  - id: c000000000000000000000001
+    name: Mini Methodology
+    shortName: MINI-M1
+    description: Mini methodology.
+    origin: import
+    isEditable: true
+    sourceId: null
+    sourceKey: null
+    sourceValue: null
+    tags: []
+tactics:
+  - id: c000000000000000000000002
+    name: Mini Tactic 1
+    shortName: MINI-T1
+    description: Tactic 1.
+    origin: import
+    isEditable: true
+    sourceId: null
+    sourceKey: null
+    sourceValue: null
+    methodologyIds:
+      - c000000000000000000000001
+    tags: []
+  - id: c000000000000000000000003
+    name: Mini Tactic 2
+    shortName: MINI-T2
+    description: Tactic 2.
+    origin: import
+    isEditable: true
+    sourceId: null
+    sourceKey: null
+    sourceValue: null
+    methodologyIds:
+      - c000000000000000000000001
+    tags: []
+techniques:
+  - id: c000000000000000000000004
+    name: Mini Technique 1
+    shortName: MINI-K1
+    description: Technique 1.
+    origin: import
+    isEditable: true
+    sourceId: null
+    sourceKey: null
+    sourceValue: null
+    tacticIds:
+      - c000000000000000000000002
+    tags: []
+  - id: c000000000000000000000005
+    name: Mini Technique 2
+    shortName: MINI-K2
+    description: Technique 2.
+    origin: import
+    isEditable: true
+    sourceId: null
+    sourceKey: null
+    sourceValue: null
+    tacticIds:
+      - c000000000000000000000003
+    tags: []
+repositories:
+  - id: c000000000000000000000006
+    name: Mini Repository
+    shortName: MINI-R1
+    description: Mini repository.
+    type: managed
+    origin: import
+    isEditable: true
+procedures:
+  - id: c000000000000000000000007
+    name: Mini procedure one
+    shortName: MINI-P1
+    description: Procedure one.
+    repositoryId: c000000000000000000000006
+    origin: import
+    isEditable: true
+    sourceId: null
+    sourceKey: null
+    sourceValue: null
+    executionSteps:
+      - description: Step for procedure one.
+        successCriteria: null
+    techniqueIds:
+      - c000000000000000000000004
+    tags: []
+  - id: c000000000000000000000008
+    name: Mini procedure two
+    shortName: MINI-P2
+    description: Procedure two.
+    repositoryId: c000000000000000000000006
+    origin: import
+    isEditable: true
+    sourceId: null
+    sourceKey: null
+    sourceValue: null
+    executionSteps:
+      - description: Step for procedure two.
+        successCriteria: null
+    techniqueIds:
+      - c000000000000000000000004
+    tags: []
+  - id: c000000000000000000000009
+    name: Mini procedure three
+    shortName: MINI-P3
+    description: Procedure three.
+    repositoryId: c000000000000000000000006
+    origin: import
+    isEditable: true
+    sourceId: null
+    sourceKey: null
+    sourceValue: null
+    executionSteps:
+      - description: Step for procedure three.
+        successCriteria: null
+    techniqueIds:
+      - c000000000000000000000005
+    tags: []
+  - id: c000000000000000000000010
+    name: Mini procedure four
+    shortName: MINI-P4
+    description: Procedure four.
+    repositoryId: c000000000000000000000006
+    origin: import
+    isEditable: true
+    sourceId: null
+    sourceKey: null
+    sourceValue: null
+    executionSteps:
+      - description: Step for procedure four.
+        successCriteria: null
+    techniqueIds:
+      - c000000000000000000000005
+    tags: []
+testPlan: &ref_0
+  id: c000000000000000000000011
+  title: Mini plan
+  description: null
+  type: custom
+  origin: api
+  isEditable: true
+  procedureIds:
+    - c000000000000000000000007
+    - c000000000000000000000008
+    - c000000000000000000000009
+  tags: []
+runbook: *ref_0

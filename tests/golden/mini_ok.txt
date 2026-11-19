@@ -1,0 +1,7 @@
+== exit ==
+0
+== stdout ==
+mini_ok.yaml  (10 objects, 3 KB)
+  0 error(s), 0 warning(s)
+  OK to import
+== stderr ==
