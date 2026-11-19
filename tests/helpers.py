@@ -2,9 +2,11 @@
 import importlib.util
 import os
 import re
+import select
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Union
 
@@ -135,6 +137,64 @@ def run_cli(args: List[str], files: Dict[str, Union[str, bytes]], read_after: Op
         if read_after and (Path(folder) / read_after).exists():
             after = (Path(folder) / read_after).read_text(encoding="utf-8")
         return CliRun(proc.stdout, proc.stderr, proc.returncode, after)
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+class PtySession:
+    """The script in a pseudo-terminal, driven like a person at a keyboard (POSIX only)."""
+
+    def __init__(self, args: List[str], cwd: Path, cols: int = 100, rows: int = 40):
+        import fcntl
+        import pty
+        import struct
+        import termios
+        env = dict(os.environ, TERM="xterm-256color", COLORTERM="truecolor", PYTHONIOENCODING="utf-8")
+        for name in ("NO_COLOR", "COLUMNS", "LINES"):
+            env.pop(name, None)
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                import signal
+                signal.signal(signal.SIGINT, signal.SIG_DFL)  # so Ctrl+C reaches the script
+                fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+                os.chdir(str(cwd))
+                os.execve(sys.executable, [sys.executable, str(SCRIPT), *args], env)
+            finally:
+                os._exit(127)
+        self.pid, self.fd, self._buf, self.raw = pid, fd, b"", ""
+
+    def _read(self, timeout: float) -> Optional[bool]:
+        """True if data arrived, False on timeout, None at end of output."""
+        if not select.select([self.fd], [], [], max(0.0, timeout))[0]:
+            return False
+        try:
+            data = os.read(self.fd, 4096)
+        except OSError:
+            return None
+        if not data:
+            return None
+        self._buf += data
+        self.raw = self._buf.decode("utf-8", "replace")
+        return True
+
+    def expect(self, text: str, timeout: float = 15) -> None:
+        deadline = time.monotonic() + timeout
+        while text not in _ANSI.sub("", self.raw):
+            if time.monotonic() >= deadline or self._read(deadline - time.monotonic()) is None:
+                raise AssertionError(f"never saw {text!r}; screen ended with:\n{_ANSI.sub('', self.raw)[-1500:]}")
+
+    def send(self, s: str) -> None:
+        os.write(self.fd, s.encode("utf-8"))
+
+    def wait(self, timeout: float = 15) -> int:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and self._read(0.2) is not None:
+            pass
+        _, status = os.waitpid(self.pid, 0)
+        os.close(self.fd)
+        return os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
 
 
 def format_run(run: CliRun) -> str:

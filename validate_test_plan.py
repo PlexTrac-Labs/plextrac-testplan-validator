@@ -30,8 +30,10 @@ import json
 import os
 import re
 import select
+import shutil
 import sys
 import threading
+import time
 import unicodedata
 from pathlib import Path
 from typing import (Any, Callable, Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Set,
@@ -1280,6 +1282,7 @@ def write_repair(doc: dict, text: str, rep: Report, target: Path, out: Any, caps
         new_text, fixed = repaired_text(doc, text)
         with open(target, "w", encoding="utf-8") as f:
             f.write(new_text)
+        _WRITTEN.append(target)
     with Spinner([("Re-checking ", ""), (target.name, "bold"), ("…", "")], out, caps.truecolor):
         again = run_checks(new_text)
     left = len(again.report.errors) + len(again.report.warnings)
@@ -1364,21 +1367,139 @@ def run_plain(args: argparse.Namespace, text: str) -> int:
     return 1 if rep.errors else 0
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+# --------------------------------------------------------------------------- picker and main
+
+_WRITTEN: List[Path] = []  # repaired copies written during this run, for the Ctrl+C message
+
+
+def list_plans(folder: Path) -> List[Path]:
+    try:
+        found = [p for p in folder.iterdir() if p.suffix.lower() in (".yaml", ".yml") and p.is_file()]
+    except OSError:
+        return []
+    return sorted(found, key=lambda p: p.name)
+
+
+def age_text(seconds: float) -> str:
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds >= size:
+            n = int(seconds // size)
+            return f"{n} {unit}{'' if n == 1 else 's'} ago"
+    return "just now"
+
+
+def pick_file(folder: Path, out: Any, keys: Iterator[str], caps: Caps) -> Optional[Path]:
+    """Arrow-key picker over the folder's test plans."""
+    plans = list_plans(folder)
+    t = caps.truecolor
+    _emit(out, [render([("  found ", "dim"), (str(len(plans)), "bold"),
+                        (f" test plan{'' if len(plans) == 1 else 's'} in ", "dim"),
+                        (folder.name + "/", "bold")], t), ""])
+    now = time.time()
+    labels: List[Line] = []
+    for plan in plans:
+        info = plan.stat()
+        labels.append([(plan.name.ljust(20), "bold"), (" ", ""),
+                       (f"{info.st_size // 1024:>4} KB · {age_text(now - info.st_mtime)}", "dim")])
+    choice = choose(labels, [("Which test plan?", "bold")], out, keys, t, max(3, caps.height - 8))
+    return None if choice is None else plans[choice]
+
+
+def run_fancy(args: argparse.Namespace, wants_help: bool, out: Any, keys: Iterator[str], caps: Caps) -> int:
+    """The graphical run. Returns the exit code."""
+    t = caps.truecolor
+    _emit(out, banner(caps.width, t))
+    if wants_help:
+        _emit(out, help_screen(caps))
+        return 0
+    path = args.path
+    if path is None:
+        folder = Path.cwd()
+        if not list_plans(folder):
+            _emit(out, nothing_to_pick_panel(folder, caps))
+            return 2
+        picked = pick_file(folder, out, keys, caps)
+        if picked is None:
+            _emit(out, [cancelled_line(caps)])
+            return 2
+        path = str(picked)
+    try:
+        text = read_plan(path)
+    except (OSError, UnicodeDecodeError) as e:
+        _emit(out, cannot_open_panel(path, e, caps))
+        return 2
+    name = Path(path).name
+    started = time.perf_counter()
+    with Spinner([("Validating ", ""), (name, "bold"), ("…", "")], out, t):
+        res = run_checks(text)
+    seconds = time.perf_counter() - started
+    rep = res.report
+    if res.parse_error is not None:
+        _emit(out, syntax_error_screen(name, text, res.parse_error, caps))
+        others = Report()
+        others.errors = [i for i in rep.errors if i["check"] != "yaml.parse"]
+        others.warnings = list(rep.warnings)
+        if others.errors or (others.warnings and not args.quiet):
+            _emit(out, issues_table(others, set(), args.quiet, caps))
+        return 1
+    auto = auto_fixed(res.doc, rep)
+    _emit(out, results_panel(name, plan_stats(res.doc), rep, len(text) // 1024, seconds, caps))
+    if rep.errors or (rep.warnings and not args.quiet):
+        _emit(out, issues_table(rep, auto, args.quiet, caps))
+    if args.fix:
+        if can_repair(res.doc):
+            write_repair(res.doc, text, rep, Path(args.fix), out, caps)
+        else:
+            _say(out, "Can't repair this file automatically: it has no testPlan section.", caps)
+    elif caps.interactive:
+        offer_repair(Path(path), text, res, auto, out, keys, caps)
+    return 1 if rep.errors else 0
+
+
+def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Validate a PlexTrac Runbooks V2 "
                                              "test plan YAML before importing it.")
-    ap.add_argument("path")
+    ap.add_argument("path", nargs="?")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--fix", metavar="OUT", help="write a repaired copy to OUT")
     ap.add_argument("--quiet", action="store_true", help="errors only")
+    ap.add_argument("--plain", action="store_true", help="plain text output, even in a terminal")
+    return ap
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    size = shutil.get_terminal_size((80, 24))
+    caps = detect_mode("--plain" in argv, "--json" in argv, os.environ, sys.stdout, sys.stdin, sys.platform,
+                       (size.columns, size.lines), enable_windows_vt)
+    ap = _parser()
+    if caps.fancy and ("-h" in argv or "--help" in argv):
+        return run_fancy(argparse.Namespace(path=None, quiet=False, fix=None), True, sys.stdout, iter(()), caps)
     args = ap.parse_args(argv)
 
+    if not caps.fancy:
+        if args.path is None:
+            ap.error("the following arguments are required: path")
+        try:
+            text = read_plan(args.path)
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"cannot read {args.path}: {e}", file=sys.stderr)
+            return 2
+        return run_plain(args, text)
+
+    if args.path is None and not caps.interactive:
+        ap.error("the following arguments are required: path")
+    del _WRITTEN[:]
+    keys = terminal_keys(sys.stdin) if caps.interactive else iter(())
     try:
-        text = read_plan(args.path)
-    except (OSError, UnicodeDecodeError) as e:
-        print(f"cannot read {args.path}: {e}", file=sys.stderr)
-        return 2
-    return run_plain(args, text)
+        if caps.interactive and sys.platform != "win32":
+            with cbreak(sys.stdin.fileno()):
+                return run_fancy(args, False, sys.stdout, keys, caps)
+        return run_fancy(args, False, sys.stdout, keys, caps)
+    except KeyboardInterrupt:
+        sys.stdout.write("\x1b[?25h\n")
+        _emit(sys.stdout, [cancelled_line(caps, wrote=bool(_WRITTEN))])
+        return 130
 
 
 if __name__ == "__main__":
