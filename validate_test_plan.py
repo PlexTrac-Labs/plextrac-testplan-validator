@@ -26,7 +26,7 @@ import argparse
 import json
 import re
 import sys
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 try:
     import yaml
@@ -395,6 +395,102 @@ def plan_stats(doc: Any) -> PlanStats:
 def read_plan(path: str) -> str:
     with open(path, encoding="utf-8") as f:
         return f.read()
+
+
+# --------------------------------------------------------------------------- repair preview
+
+DUMP_FIXED = ("yaml.anchors", "yaml.bom", "yaml.tabs", "yaml.anchor_name", "yaml.alias_name")
+_REPAIR_FIELDS = (("methodologies", ("tags",)), ("tactics", ("methodologyIds", "tags")),
+                  ("techniques", ("tacticIds", "tags")), ("procedures", ("techniqueIds", "tags")))
+
+
+class Change(NamedTuple):
+    section: str
+    name: str
+    field: str
+    removed: List[Any]
+
+
+def copy_for_repair(doc: dict) -> dict:
+    """A copy autofix can change without touching `doc`. autofix only reassigns fields,
+    so copying each object one level deep is enough."""
+    out = dict(doc)
+    for section in SECTIONS:
+        if isinstance(doc.get(section), list):
+            out[section] = [dict(o) if isinstance(o, dict) else o for o in doc[section]]
+    if isinstance(doc.get("testPlan"), dict):
+        out["testPlan"] = dict(doc["testPlan"])
+        if doc.get("runbook") is doc["testPlan"]:
+            out["runbook"] = out["testPlan"]
+    return out
+
+
+def can_repair(doc: Any) -> bool:
+    """dump() needs a testPlan mapping to anchor the runbook alias on."""
+    return isinstance(doc, dict) and isinstance(doc.get("testPlan"), dict)
+
+
+def repaired_text(doc: dict, text: str) -> Tuple[str, dict]:
+    """What --fix would write, without changing `doc`."""
+    fixed = copy_for_repair(doc)
+    autofix(fixed, text, Report())
+    return dump(fixed), fixed
+
+
+def auto_fixed(doc: Any, rep: Report) -> Set[IssueKey]:
+    """The issues in `rep` that a repaired copy would no longer have. Never parses YAML."""
+    if not can_repair(doc):
+        return set()
+    fixed = copy_for_repair(doc)
+    autofix(fixed, "", Report())
+    fixed["runbook"] = fixed["testPlan"]
+    after = Report()
+    if check_structure(fixed, after):
+        check_objects(fixed, after)
+        check_references(fixed, after)
+        check_content(fixed, after)
+    remaining = {issue_key(i) for i in after.errors + after.warnings}
+    gone = set()
+    for item in rep.errors + rep.warnings:
+        check = item["check"]
+        if check in DUMP_FIXED or (not check.startswith("yaml.") and issue_key(item) not in remaining):
+            gone.add(issue_key(item))
+    return gone
+
+
+def repair_changes(before: dict, after: dict) -> List[Change]:
+    """Per object, the list values the repair removed (for the receipt)."""
+    changes = []
+    for section, fields in _REPAIR_FIELDS:
+        for b, a in zip(_objects(before, section), _objects(after, section)):
+            for field in fields:
+                old, new = b.get(field), a.get(field)
+                if isinstance(old, list) and old != new:
+                    kept = new if isinstance(new, list) else []
+                    name = str(b.get("shortName") or b.get("name") or "")
+                    changes.append(Change(section, name, field, [v for v in old if v not in kept]))
+    tb, ta = before.get("testPlan"), after.get("testPlan")
+    if isinstance(tb, dict) and isinstance(ta, dict) and isinstance(tb.get("tags"), list) \
+            and tb["tags"] != ta.get("tags"):
+        changes.append(Change("testPlan", str(tb.get("title") or ""), "tags", list(tb["tags"])))
+    return changes
+
+
+def file_fixes(rep: Report) -> List[str]:
+    """File-level fixes a rewrite makes, for the receipt."""
+    checks = {i["check"] for i in rep.errors + rep.warnings}
+    lines = []
+    if "yaml.anchors" in checks:
+        lines.append("stray anchors removed")
+    if "yaml.bom" in checks:
+        lines.append("byte order mark dropped")
+    if "yaml.tabs" in checks:
+        lines.append("tab characters escaped")
+    if any(i["check"] == "schema.sections" and "runbook" in i["message"] for i in rep.errors):
+        lines.append("runbook section added")
+    elif "runbook.alias" in checks:
+        lines.append("runbook made an alias of testPlan")
+    return lines
 
 
 def run_plain(args: argparse.Namespace, text: str) -> int:
