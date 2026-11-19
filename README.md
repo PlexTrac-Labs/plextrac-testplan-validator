@@ -15,13 +15,24 @@ pip3 install pyyaml
 ## Usage
 
 ```bash
+python3 validate_test_plan.py                            # pick a plan from this folder
 python3 validate_test_plan.py plan.yaml                  # check a file
 python3 validate_test_plan.py plan.yaml --json           # machine-readable output
 python3 validate_test_plan.py plan.yaml --quiet          # errors only, no warnings
 python3 validate_test_plan.py plan.yaml --fix out.yaml   # write a repaired copy
+python3 validate_test_plan.py plan.yaml --plain          # plain text, even in a terminal
 ```
 
-Exit codes: `0` clean, `1` errors found, `2` file unreadable.
+In a terminal the validator draws its results: a banner, a summary box with the object counts and a pass or fail for each group of checks, and a table of problems marked `auto` (the repair fixes it) or `by hand`. Run it without a file name to pick one from the current folder with the arrow keys.
+
+When the output goes to a pipe or a file, or with `--plain` or `--json`, it prints the plain text shown under [Example](#example), unchanged from earlier versions, so scripts keep working. Setting `NO_COLOR=1`, or a terminal narrower than 60 columns, also gives plain text. On Windows the graphics appear in Windows Terminal and the VS Code terminal; the classic console window gets plain text.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | No errors (warnings allowed) |
+| `1` | Errors found, including YAML syntax errors |
+| `2` | The file couldn't be read, there was nothing to pick, or the picker was cancelled |
+| `130` | Cancelled with Ctrl+C |
 
 Errors block the import. Warnings do not, but are usually worth a look.
 
@@ -81,8 +92,27 @@ Every cross-reference resolves inside the file: `methodologyIds`, `tacticIds`, `
 python3 validate_test_plan.py broken.yaml --fix fixed.yaml
 ```
 
-Writes a new file and leaves the original untouched. It performs mechanical repairs only: dropping dangling reference IDs and emptying tag arrays. It will not invent IDs or restructure content, so anything else reported needs fixing by hand.
+Writes a new file and leaves the original untouched. It performs mechanical repairs only: dropping dangling reference IDs and emptying tag arrays. Writing the file fresh also removes stray YAML anchors, tab characters and byte order marks, and restores `runbook` as an alias of `testPlan`. It will not invent IDs or restructure content, so anything else reported needs fixing by hand.
+
+In a terminal you don't need `--fix`. When some of the problems can be repaired, the validator offers to save a repaired copy:
+
+1. It asks before writing anything (Enter means yes).
+2. It suggests `<name>.fixed.yaml` next to the original. Edit the name with the arrow keys, Backspace and Delete.
+3. It refuses to write over the original file, and asks before replacing any other existing file (Enter means no).
+4. It shows what changed, object by object, then checks the repaired copy and says whether it's ready to import.
+
+The exit code still describes the original file.
 
 ## Known exporter issue
 
 If a test plan has tactics belonging to more than one methodology, the export writes the link to the second methodology but not the methodology itself. The resulting file cannot be imported anywhere and fails on a foreign key constraint. Running `--fix` on such an export drops the unresolvable link and produces an importable file.
+
+## Development
+
+The tests use the standard library only. From this folder:
+
+```bash
+python3 -m unittest discover -s tests -t .
+```
+
+They compare the plain and JSON output against recorded copies in `tests/golden/`, so any change to that output shows up as a failure. `tests/MANUAL_CHECKLIST.md` lists the hands-on checks for macOS, Linux and Windows.
