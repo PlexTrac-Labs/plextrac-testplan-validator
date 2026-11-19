@@ -23,13 +23,17 @@ Exit codes: 0 clean (warnings allowed), 1 errors found, 2 could not read file.
 Requires PyYAML only.
 """
 import argparse
+import contextlib
 import functools
 import json
+import os
 import re
+import select
 import sys
 import threading
 import unicodedata
-from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
+from typing import (Any, Callable, Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Set,
+                    Tuple)
 
 try:
     import yaml
@@ -821,6 +825,214 @@ class Spinner:
             self._thread.join()
         self.out.write("\r\x1b[2K\x1b[?25h")
         self.out.flush()
+
+
+# --------------------------------------------------------------------------- keys and widgets
+
+_KEYS = {
+    "\x1b[A": "up", "\x1bOA": "up", "\x1b[B": "down", "\x1bOB": "down",
+    "\x1b[C": "right", "\x1bOC": "right", "\x1b[D": "left", "\x1bOD": "left",
+    "\x1b[H": "home", "\x1bOH": "home", "\x1b[1~": "home", "\x1b[7~": "home",
+    "\x1b[F": "end", "\x1bOF": "end", "\x1b[4~": "end", "\x1b[8~": "end",
+    "\x1b[3~": "delete", "\x1b": "esc", "\r": "enter", "\n": "enter",
+    "\x7f": "backspace", "\x08": "backspace", "\x03": "ctrl-c", "\t": "tab",
+}
+_WINDOWS_KEYS = {"H": "up", "P": "down", "K": "left", "M": "right", "G": "home", "O": "end", "S": "delete"}
+
+
+def decode_key(seq: str) -> str:
+    """Raw key bytes (as text) -> a key name, or the typed character itself."""
+    if seq in _KEYS:
+        return _KEYS[seq]
+    if len(seq) == 1 and seq.isprintable():
+        return seq
+    return "unknown"
+
+
+def decode_windows_key(prefix: str, code: str) -> str:
+    return _WINDOWS_KEYS.get(code, "unknown")
+
+
+@contextlib.contextmanager
+def cbreak(fd: int) -> Iterator[None]:
+    """Keys arrive one at a time without echo; Ctrl+C still interrupts. No flush, so
+    keys typed early are kept."""
+    import termios
+    old = termios.tcgetattr(fd)
+    new = termios.tcgetattr(fd)
+    new[3] &= ~(termios.ECHO | termios.ICANON)
+    new[6][termios.VMIN] = 1
+    new[6][termios.VTIME] = 0
+    termios.tcsetattr(fd, termios.TCSANOW, new)
+    try:
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSANOW, old)
+
+
+def _ready(fd: int, timeout: float) -> bool:
+    return bool(select.select([fd], [], [], timeout)[0])
+
+
+def _read_posix_key(fd: int) -> Optional[str]:
+    """One key: a byte, an escape sequence up to its final byte, or a UTF-8 character."""
+    first = os.read(fd, 1)
+    if not first:
+        return None
+    data = first
+    if first == b"\x1b":
+        if _ready(fd, 0.05):
+            data += os.read(fd, 1)
+            if data.endswith(b"["):
+                while _ready(fd, 0.05):
+                    data += os.read(fd, 1)
+                    if 0x40 <= data[-1] <= 0x7E:
+                        break
+            elif data.endswith(b"O") and _ready(fd, 0.05):
+                data += os.read(fd, 1)
+    elif first[0] >= 0xC0:
+        size = 2 if first[0] < 0xE0 else 3 if first[0] < 0xF0 else 4
+        while len(data) < size and _ready(fd, 0.05):
+            data += os.read(fd, 1)
+    return data.decode("utf-8", "replace")
+
+
+def terminal_keys(stdin: Any) -> Iterator[str]:
+    """Key names from the real keyboard. Ends when input closes."""
+    if sys.platform == "win32":
+        import msvcrt
+        while True:
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):
+                yield decode_windows_key(ch, msvcrt.getwch())
+            else:
+                yield decode_key(ch)
+    fd = stdin.fileno()
+    while True:
+        seq = _read_posix_key(fd)
+        if seq is None:
+            return
+        yield decode_key(seq)
+
+
+def _next_key(keys: Iterator[str]) -> str:
+    key = next(keys, "esc")  # input closed counts as Esc
+    if key == "ctrl-c":
+        raise KeyboardInterrupt
+    return key
+
+
+def _question(text: Line) -> Line:
+    return [("? ", f"bold fg:{ACCENT}")] + text + [("  ", "")]
+
+
+def choose(options: List[Line], title: Line, out: Any, keys: Iterator[str], truecolor: bool,
+           max_rows: int) -> Optional[int]:
+    """Arrow-key menu. Returns the chosen index, or None on Esc. Erases itself."""
+    if not options:
+        return None
+    rows = max(1, max_rows)
+    index, top, drawn = 0, 0, 0
+    out.write("\x1b[?25l")
+    try:
+        while True:
+            top = min(max(top, index - rows + 1), index)
+            lines = [render([("? ", f"bold fg:{ACCENT}")] + title, truecolor)]
+            for i in range(top, min(len(options), top + rows)):
+                marker = ("❯ ", f"bold fg:{ACCENT}") if i == index else ("  ", "")
+                lines.append(render([marker] + options[i], truecolor))
+            lines += ["", render([("  ↑/↓ move · enter choose · esc cancel", "dim")], truecolor)]
+            if drawn:
+                out.write(f"\x1b[{drawn}F\x1b[J")
+            out.write("\n".join(lines) + "\n")
+            out.flush()
+            drawn = len(lines)
+            key = _next_key(keys)
+            if key == "enter":
+                return index
+            if key == "esc":
+                return None
+            if key == "up":
+                index = max(0, index - 1)
+            elif key == "down":
+                index = min(len(options) - 1, index + 1)
+            elif key == "home":
+                index = 0
+            elif key == "end":
+                index = len(options) - 1
+    finally:
+        if drawn:
+            out.write(f"\x1b[{drawn}F\x1b[J")
+        out.write("\x1b[?25h")
+        out.flush()
+
+
+def confirm(question: Line, default: bool, out: Any, keys: Iterator[str], truecolor: bool) -> Optional[bool]:
+    """Yes/no question. Enter takes the default, Esc returns None."""
+    head = _question(question)
+    out.write(render(head + [("(Y/n)" if default else "(y/N)", "dim")], truecolor))
+    out.flush()
+    try:
+        while True:
+            key = _next_key(keys)
+            if key in ("y", "Y", "n", "N", "enter", "esc"):
+                break
+    except KeyboardInterrupt:
+        out.write("\n")
+        out.flush()
+        raise
+    answer = {"y": True, "Y": True, "n": False, "N": False, "enter": default}.get(key)
+    shown = [] if answer is None else [("Yes" if answer else "No", f"fg:{ACCENT}")]
+    out.write("\r\x1b[2K" + render(head + shown, truecolor) + "\n")
+    out.flush()
+    return answer
+
+
+def prompt(label: Line, initial: str, out: Any, keys: Iterator[str], truecolor: bool) -> Optional[str]:
+    """One-line text input, pre-filled with `initial`. Esc returns None."""
+    head = _question(label)
+    chars, pos = list(initial), len(initial)
+    out.write("\x1b[?25h")
+    try:
+        while True:
+            out.write("\r\x1b[2K" + render(head, truecolor) + "".join(chars))
+            back = cell_width("".join(chars[pos:]))
+            if back:
+                out.write(f"\x1b[{back}D")
+            out.flush()
+            key = _next_key(keys)
+            if key == "enter":
+                break
+            if key == "esc":
+                out.write("\n")
+                out.flush()
+                return None
+            if key == "left":
+                pos = max(0, pos - 1)
+            elif key == "right":
+                pos = min(len(chars), pos + 1)
+            elif key == "home":
+                pos = 0
+            elif key == "end":
+                pos = len(chars)
+            elif key == "backspace":
+                if pos:
+                    del chars[pos - 1]
+                    pos -= 1
+            elif key == "delete":
+                if pos < len(chars):
+                    del chars[pos]
+            elif len(key) == 1 and key.isprintable():
+                chars.insert(pos, key)
+                pos += 1
+    except KeyboardInterrupt:
+        out.write("\n")
+        out.flush()
+        raise
+    text = "".join(chars)
+    out.write("\r\x1b[2K" + render(head + [(text, f"fg:{ACCENT}")], truecolor) + "\n")
+    out.flush()
+    return text
 
 
 def run_plain(args: argparse.Namespace, text: str) -> int:
