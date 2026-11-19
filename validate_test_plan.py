@@ -728,6 +728,11 @@ def fit(line: Line, width: int) -> Line:
     return out
 
 
+def _fit_to(line: Line, width: int) -> Line:
+    """Keep a line that is redrawn in place on one terminal row (width 0 = no limit)."""
+    return fit(line, width - 1) if width else line
+
+
 def gradient_line(text: str, bold: bool = True) -> Line:
     n = max(len(text) - 1, 1)
     weight = "bold " if bold else ""
@@ -802,8 +807,8 @@ SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 class Spinner:
     """A one-line spinner while the body runs, erased afterwards."""
 
-    def __init__(self, text: Line, out: Any, truecolor: bool, interval: float = 0.08):
-        self.text, self.out, self.truecolor, self.interval = text, out, truecolor, interval
+    def __init__(self, text: Line, out: Any, truecolor: bool, interval: float = 0.08, width: int = 0):
+        self.text, self.out, self.truecolor, self.interval, self.width = text, out, truecolor, interval, width
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -811,7 +816,7 @@ class Spinner:
         i = 0
         while not self._stop.is_set():
             frame = [(SPINNER_FRAMES[i % len(SPINNER_FRAMES)], f"bold fg:{ACCENT}"), (" ", "")]
-            self.out.write("\r" + render(frame + self.text, self.truecolor))
+            self.out.write("\r" + render(_fit_to(frame + self.text, self.width), self.truecolor))
             self.out.flush()
             i += 1
             self._stop.wait(self.interval)
@@ -931,7 +936,7 @@ def _question(text: Line) -> Line:
 
 
 def choose(options: List[Line], title: Line, out: Any, keys: Iterator[str], truecolor: bool,
-           max_rows: int) -> Optional[int]:
+           max_rows: int, width: int = 0) -> Optional[int]:
     """Arrow-key menu. Returns the chosen index, or None on Esc. Erases itself."""
     if not options:
         return None
@@ -941,11 +946,11 @@ def choose(options: List[Line], title: Line, out: Any, keys: Iterator[str], true
     try:
         while True:
             top = min(max(top, index - rows + 1), index)
-            lines = [render([("? ", f"bold fg:{ACCENT}")] + title, truecolor)]
+            lines = [render(_fit_to([("? ", f"bold fg:{ACCENT}")] + title, width), truecolor)]
             for i in range(top, min(len(options), top + rows)):
                 marker = ("❯ ", f"bold fg:{ACCENT}") if i == index else ("  ", "")
-                lines.append(render([marker] + options[i], truecolor))
-            lines += ["", render([("  ↑/↓ move · enter choose · esc cancel", "dim")], truecolor)]
+                lines.append(render(_fit_to([marker] + options[i], width), truecolor))
+            lines += ["", render(_fit_to([("  ↑/↓ move · enter choose · esc cancel", "dim")], width), truecolor)]
             if drawn:
                 out.write(f"\x1b[{drawn}F\x1b[J")
             out.write("\n".join(lines) + "\n")
@@ -971,10 +976,11 @@ def choose(options: List[Line], title: Line, out: Any, keys: Iterator[str], true
         out.flush()
 
 
-def confirm(question: Line, default: bool, out: Any, keys: Iterator[str], truecolor: bool) -> Optional[bool]:
+def confirm(question: Line, default: bool, out: Any, keys: Iterator[str], truecolor: bool,
+            width: int = 0) -> Optional[bool]:
     """Yes/no question. Enter takes the default, Esc returns None."""
     head = _question(question)
-    out.write(render(head + [("(Y/n)" if default else "(y/N)", "dim")], truecolor))
+    out.write(render(_fit_to(head + [("(Y/n)" if default else "(y/N)", "dim")], width), truecolor))
     out.flush()
     try:
         while True:
@@ -987,20 +993,27 @@ def confirm(question: Line, default: bool, out: Any, keys: Iterator[str], trueco
         raise
     answer = {"y": True, "Y": True, "n": False, "N": False, "enter": default}.get(key)
     shown = [] if answer is None else [("Yes" if answer else "No", f"fg:{ACCENT}")]
-    out.write("\r\x1b[2K" + render(head + shown, truecolor) + "\n")
+    out.write("\r\x1b[2K" + render(_fit_to(head + shown, width), truecolor) + "\n")
     out.flush()
     return answer
 
 
-def prompt(label: Line, initial: str, out: Any, keys: Iterator[str], truecolor: bool) -> Optional[str]:
-    """One-line text input, pre-filled with `initial`. Esc returns None."""
+def prompt(label: Line, initial: str, out: Any, keys: Iterator[str], truecolor: bool,
+           width: int = 0) -> Optional[str]:
+    """One-line text input, pre-filled with `initial`. Esc returns None. Text longer than the
+    terminal scrolls sideways so the line never wraps."""
     head = _question(label)
     chars, pos = list(initial), len(initial)
+    room = width - 1 - line_width(head) if width else 0
     out.write("\x1b[?25h")
     try:
         while True:
-            out.write("\r\x1b[2K" + render(head, truecolor) + "".join(chars))
-            back = cell_width("".join(chars[pos:]))
+            start, visible = 0, chars
+            if room > 0 and cell_width("".join(chars)) > room:
+                start = 0 if pos <= room else pos - room
+                visible = chars[start:start + room]
+            out.write("\r\x1b[2K" + render(head, truecolor) + "".join(visible))
+            back = cell_width("".join(visible[pos - start:]))
             if back:
                 out.write(f"\x1b[{back}D")
             out.flush()
@@ -1034,7 +1047,7 @@ def prompt(label: Line, initial: str, out: Any, keys: Iterator[str], truecolor: 
         out.flush()
         raise
     text = "".join(chars)
-    out.write("\r\x1b[2K" + render(head + [(text, f"fg:{ACCENT}")], truecolor) + "\n")
+    out.write("\r\x1b[2K" + render(_fit_to(head + [(text, f"fg:{ACCENT}")], width), truecolor) + "\n")
     out.flush()
     return text
 
@@ -1165,8 +1178,14 @@ def syntax_error_screen(name: str, text: str, err: Any, caps: Caps) -> List[str]
             body.append([(number, f"bold fg:{ACCENT}" if here else "dim"), (" │ ", "dim"),
                          (lines[n].replace("\t", " "), "bold" if here else "dim")])
             if here:
-                body.append([(" " * num_w, ""), (" │ ", "dim"),
-                             (" " * mark.column + "▲ " + problem, f"bold fg:{RED}")])
+                gutter: Line = [(" " * num_w, ""), (" │ ", "dim")]
+                code_w = w - 6 - num_w - 3  # box inside, minus the line-number gutter
+                if mark.column + 2 + cell_width(problem) <= code_w:
+                    body.append(gutter + [(" " * mark.column + "▲ " + problem, f"bold fg:{RED}")])
+                else:  # the message gets its own line(s) so it is never cut off
+                    if mark.column < code_w:
+                        body.append(gutter + [(" " * mark.column + "▲", f"bold fg:{RED}")])
+                    body += [gutter + [(part, f"bold fg:{RED}")] for part in wrap_cells(problem, max(10, code_w))]
     else:
         body.append([(problem, f"fg:{RED}")])
     out = box(body, title, w, RED, t)
@@ -1276,14 +1295,26 @@ def recheck_panel(name: str, res: CheckResult, stats: PlanStats, caps: Caps) -> 
     return box([line], [("re-checked · ", ""), (name, "bold")], _width(caps), border, caps.truecolor, pad_y=0)
 
 
-def write_repair(doc: dict, text: str, rep: Report, target: Path, out: Any, caps: Caps) -> CheckResult:
-    """Write the repaired copy, re-check it, and show what changed."""
-    with Spinner([("Repairing → ", ""), (target.name, "bold"), ("…", "")], out, caps.truecolor):
-        new_text, fixed = repaired_text(doc, text)
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(new_text)
-        _WRITTEN.append(target)
-    with Spinner([("Re-checking ", ""), (target.name, "bold"), ("…", "")], out, caps.truecolor):
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return a.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def write_repair(doc: dict, text: str, rep: Report, target: Path, out: Any, caps: Caps) -> Optional[CheckResult]:
+    """Write the repaired copy, re-check it, and show what changed. None if it couldn't be written."""
+    try:
+        with Spinner([("Repairing → ", ""), (target.name, "bold"), ("…", "")], out, caps.truecolor,
+                     width=caps.width):
+            new_text, fixed = repaired_text(doc, text)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(new_text)
+    except OSError as e:
+        _say(out, f"Can't write {target.name}: {e.strerror or e}", caps)
+        return None
+    _WRITTEN.append(target)
+    with Spinner([("Re-checking ", ""), (target.name, "bold"), ("…", "")], out, caps.truecolor, width=caps.width):
         again = run_checks(new_text)
     left = len(again.report.errors) + len(again.report.warnings)
     _emit(out, receipt_panel(target.name, repair_changes(doc, fixed), file_fixes(rep), left, caps))
@@ -1301,12 +1332,12 @@ def offer_repair(path: Path, text: str, res: CheckResult, auto: Set[IssueKey], o
     _emit(out, ["", render([("  🔧 ", ""), (f"{len(auto)} of {total}", f"bold fg:{ACCENT}"),
                             (" problems can be repaired automatically", ""),
                             ("  ·  original file untouched", "dim")], t), ""])
-    if not confirm([("Repair them and save a copy?", "bold")], True, out, keys, t):
+    if not confirm([("Repair them and save a copy?", "bold")], True, out, keys, t, width=caps.width):
         _emit(out, [cancelled_line(caps)])
         return None
     default = f"{path.stem}.fixed.yaml"
     while True:
-        name = prompt([("Save as", "bold")], default, out, keys, t)
+        name = prompt([("Save as", "bold")], default, out, keys, t, width=caps.width)
         if name is None:
             _emit(out, [cancelled_line(caps)])
             return None
@@ -1317,15 +1348,17 @@ def offer_repair(path: Path, text: str, res: CheckResult, auto: Set[IssueKey], o
         target = Path(name).expanduser()
         if not target.is_absolute():
             target = path.parent / target
-        if target.exists() and os.path.samefile(target, path):
+        if _same_file(target, path):
             _say(out, "That's your original file. Pick another name.", caps)
             continue
         if target.is_dir():
             _say(out, "That's a folder. Pick a file name.", caps)
             continue
-        if target.exists() and not confirm([(f"{target.name} exists. Overwrite?", "bold")], False, out, keys, t):
+        if target.exists() and not confirm([(f"{target.name} exists. Overwrite?", "bold")], False, out, keys, t,
+                                           width=caps.width):
             continue
-        write_repair(res.doc, text, res.report, target, out, caps)
+        if write_repair(res.doc, text, res.report, target, out, caps) is None:
+            continue
         return target
 
 
@@ -1401,7 +1434,7 @@ def pick_file(folder: Path, out: Any, keys: Iterator[str], caps: Caps) -> Option
         info = plan.stat()
         labels.append([(plan.name.ljust(20), "bold"), (" ", ""),
                        (f"{info.st_size // 1024:>4} KB · {age_text(now - info.st_mtime)}", "dim")])
-    choice = choose(labels, [("Which test plan?", "bold")], out, keys, t, max(3, caps.height - 8))
+    choice = choose(labels, [("Which test plan?", "bold")], out, keys, t, max(3, caps.height - 8), width=caps.width)
     return None if choice is None else plans[choice]
 
 
@@ -1430,7 +1463,7 @@ def run_fancy(args: argparse.Namespace, wants_help: bool, out: Any, keys: Iterat
         return 2
     name = Path(path).name
     started = time.perf_counter()
-    with Spinner([("Validating ", ""), (name, "bold"), ("…", "")], out, t):
+    with Spinner([("Validating ", ""), (name, "bold"), ("…", "")], out, t, width=caps.width):
         res = run_checks(text)
     seconds = time.perf_counter() - started
     rep = res.report
@@ -1447,10 +1480,15 @@ def run_fancy(args: argparse.Namespace, wants_help: bool, out: Any, keys: Iterat
     if rep.errors or (rep.warnings and not args.quiet):
         _emit(out, issues_table(rep, auto, args.quiet, caps))
     if args.fix:
-        if can_repair(res.doc):
-            write_repair(res.doc, text, rep, Path(args.fix), out, caps)
-        else:
+        target = Path(args.fix)
+        if not can_repair(res.doc):
             _say(out, "Can't repair this file automatically: it has no testPlan section.", caps)
+        elif _same_file(target, Path(path)):
+            _say(out, "--fix points at the original file. Nothing was written.", caps)
+        elif target.is_dir():
+            _say(out, "--fix points at a folder. Nothing was written.", caps)
+        else:
+            write_repair(res.doc, text, rep, target, out, caps)
     elif caps.interactive:
         offer_repair(Path(path), text, res, auto, out, keys, caps)
     return 1 if rep.errors else 0

@@ -1,5 +1,7 @@
 """Key decoding and the choose / confirm / prompt widgets, driven by scripted keys."""
 import io
+import re
+import time
 import unittest
 
 from tests.helpers import load_script
@@ -50,6 +52,19 @@ class WidgetTest(unittest.TestCase):
         self.assertIsNone(edit("a", ["esc"]))
         with self.assertRaises(KeyboardInterrupt):
             edit("a", ["ctrl-c"])
+
+    def test_redrawn_lines_fit_the_terminal_width(self):
+        long = "x" * 100 + ".yaml"
+        outs = [io.StringIO() for _ in range(4)]
+        vtp.choose([[(long, "")], [(long, "")]], [("Which?", "")], outs[0], iter(["down", "enter"]), True, 5, width=40)
+        edited = vtp.prompt([("Save as", "")], long, outs[1], iter(["end", "backspace", "enter"]), True, width=40)
+        self.assertEqual(edited, long[:-1])
+        vtp.confirm([(long + " exists. Overwrite?", "")], False, outs[2], iter(["enter"]), True, width=40)
+        with vtp.Spinner([("Validating " + long, "")], outs[3], True, interval=0.01, width=40):
+            time.sleep(0.03)
+        for out in outs:
+            for piece in re.split(r"[\r\n]", vtp.strip_ansi(out.getvalue())):
+                self.assertLessEqual(vtp.cell_width(piece), 39, piece)
 
     def test_running_out_of_keys_counts_as_esc(self):
         self.assertIsNone(vtp.confirm([("Sure?", "")], True, io.StringIO(), iter([]), True))

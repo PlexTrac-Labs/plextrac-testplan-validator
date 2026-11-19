@@ -66,6 +66,28 @@ class RepairFlowTest(unittest.TestCase):
         self.assertIn("broken.fixed.yaml exists. Overwrite?", s)
         self.assertEqual((self.dir / "broken.fixed.yaml").read_text(), "keep")
 
+    def _fancy(self, fix):
+        import argparse
+        out = io.StringIO()
+        args = argparse.Namespace(path=str(self.path), fix=fix, quiet=False, json=False, plain=False)
+        code = vtp.run_fancy(args, False, out, iter([]), vtp.Caps(True, False, True, 100, 40))
+        return code, vtp.strip_ansi(out.getvalue())
+
+    def test_fix_flag_never_overwrites_the_original(self):
+        code, s = self._fancy(str(self.path))
+        self.assertEqual(code, 1)
+        self.assertIn("--fix points at the original file. Nothing was written.", s)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), self.text)
+
+    def test_unwritable_names_are_reported_not_crashed(self):
+        written, s = self.flow(["enter"] + REPLACE("nodir/x.yaml") + ["enter", "esc"])
+        self.assertIsNone(written)
+        self.assertIn("Can't write x.yaml:", s)
+        self.assertIn("Cancelled. Nothing was written.", s)
+        code, s = self._fancy(str(self.dir / "nodir" / "x.yaml"))
+        self.assertEqual(code, 1)
+        self.assertIn("Can't write x.yaml:", s)
+
     def test_no_offer_without_testplan(self):
         doc = dict(self.res.doc)
         doc.pop("testPlan")

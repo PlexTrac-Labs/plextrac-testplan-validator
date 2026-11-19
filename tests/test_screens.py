@@ -53,6 +53,17 @@ class ScreenTest(unittest.TestCase):
         self.assertIn('Tip: a value that contains ": " needs quotes, like shortName: "WSTG: draft"', joined)
         self.assertIn(" NOT READY   fix the line above and run it again", joined)
 
+    def test_syntax_message_is_never_cut_off(self):
+        base = variant_text("ok")
+        for extra, caret in ((" and some more words: draft", True),
+                             (" with a much longer name that pushes the colon well right: draft", False)):
+            text = "# filler\n" * 12000 + base.replace("shortName: MINI-T1\n", "shortName: MINI-T1" + extra + "\n", 1)
+            res = vtp.run_checks(text)
+            rows = plain(vtp.syntax_error_screen("long.yaml", text, res.parse_error, CAPS))
+            self.assertTrue(any("mapping values are not allowed here" in r for r in rows), extra)
+            self.assertEqual(any("▲" in r for r in rows), caret, extra)
+            self.assertTrue(all(vtp.cell_width(r) <= 78 for r in rows))
+
     def test_cannot_open_and_nothing_to_pick(self):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "OWASP_WSTG.yaml").write_text("x")
